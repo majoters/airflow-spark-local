@@ -1,0 +1,11 @@
+py4j==0.10.9.7
+jupyterlab==4.0.7
+pandas==2.1.1
+pyarrow==16.0.0
+setuptools==75.2.0
+numpy==1.26.4
+apache-airflow==2.10.3
+apache-airflow-providers-apache-spark
+apache-airflow-providers-openlineage==1.13.0
+apache-airflow-providers-postgres
+psycopg2-binary

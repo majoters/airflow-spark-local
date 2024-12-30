@@ -1,0 +1,225 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  depends_on:
+    postgres:
+      condition: service_healthy
+    metastore:
+      condition: service_started
+  env_file:
+    - airflow.env
+  volumes:
+    - ./jobs:/opt/airflow/jobs
+    - ./dags:/opt/airflow/dags
+    - ./script:/opt/airflow/script
+    - ./logs:/opt/airflow/logs
+    - ./data:/opt/airflow/data
+
+services:
+  spark-master:
+    image: spark-in-local:latest
+    container_name: spark-master
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    entrypoint: ["/bin/bash", "-c", "/start.sh"]
+    environment:
+      SPARK_CONF_DIR: /opt/spark/conf
+      SPARK_RUN_MODE: master
+      HADOOP_CONF_DIR: /opt/hadoop/etc/hadoop
+      YARN_CONF_DIR: /opt/hadoop/etc/hadoop
+    volumes:
+      - ./conf/hadoop:/opt/hadoop/etc/hadoop
+      - ./:/home
+
+  spark-worker:
+    image: spark-in-local:latest
+    entrypoint: ["/bin/bash", "-c", "/start.sh"]
+    environment:
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_CORES: 1
+      SPARK_RUN_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+    volumes:
+      - ./conf/hadoop:/opt/hadoop/etc/hadoop
+      - ./:/home
+      
+  spark-history:
+    image: spark-in-local:latest
+    container_name: spark-history
+    ports:
+      - "18080:18080"
+    entrypoint: ["/bin/bash", "-c", "/start.sh"]
+    environment:
+      SPARK_CONF_DIR: /opt/spark/conf
+      SPARK_RUN_MODE: history
+    depends_on:
+      minio-mc:
+        condition: service_completed_successfully
+
+  notebook:
+    image: spark-in-local:latest
+    container_name: notebook
+    ports:
+      - "8089:8089"
+      - "4040-4060:4040-4060"
+    entrypoint: ["/bin/bash", "-c", "jupyter lab --ip=0.0.0.0 --port=8089 --allow-root --no-browser --NotebookApp.token=''"]
+    volumes:
+      - ./:/home
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-02T17-50-41Z
+    container_name: minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    entrypoint: sh
+    command: -c 'minio server --console-address ":9001" /data'
+  
+  minio-mc:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    container_name: init-minio-bucket
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb --ignore-existing minio/spark-warehouse;
+      /usr/bin/mc anonymous set public minio/spark-warehouse;
+      /usr/bin/mc mb --ignore-existing minio/spark-event;
+      /usr/bin/mc anonymous set public minio/spark-event;
+      /usr/bin/mc mb --ignore-existing minio/raw-data;
+      /usr/bin/mc anonymous set public minio/raw-data;
+      exit 0;
+      "
+  postgres:
+    image: postgres:12-alpine
+    container_name: pg-metastore
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: metastore_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    ports:
+      - '5432:5432'
+  
+  metastore:
+    image: spark-in-local:latest
+    container_name: metastore
+    ports:
+      - "9083:9083"
+    entrypoint: ["/bin/bash", "-c", "/start-metastore.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  
+  init-hive-db: # init hive database 
+    image: spark-in-local:latest
+    container_name: init-hive-db
+    deploy:
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+    entrypoint:
+      - "/bin/bash"
+      - "-c"
+      - "hive -e \"CREATE DATABASE IF NOT EXISTS local_db LOCATION 's3a://spark-warehouse/hive/local_db'\""
+    depends_on:
+      - metastore
+
+  init-airflow-db:
+    <<: *airflow-common
+    command: bash -c "
+      airflow db init &&
+      airflow db migrate &&
+      airflow users create --username admin --firstname Supakorn --lastname Komol --role Admin --email supakorn_komol@hotmail.com --password admin
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"  # Do not restart after it completes
+
+  scheduler:
+    <<: *airflow-common
+    command: >
+      bash -c "
+      while ! airflow db check; do
+        echo 'Waiting for database initialization...';
+        sleep 5;
+      done;
+      airflow scheduler
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  webserver:
+    <<: *airflow-common
+    command: >
+      bash -c "
+      while ! airflow db check; do
+        echo 'Waiting for database initialization...';
+        sleep 5;
+      done;
+      airflow webserver -p 8082
+      "
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+#  init-airflow-db:
+#    <<: *airflow-common
+#    command: bash -c "
+#      airflow db init &&
+#      airflow db migrate &&
+#      airflow users create --username admin --firstname Supakorn --lastname Komol --role Admin --email supakorn_komol@hotmail.com --password admin
+#      "
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD-SHELL", "airflow db check" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#
+#  scheduler:
+#    <<: *airflow-common
+#    command: >
+#      bash -c "
+#      airflow scheduler
+#      "
+#    depends_on:
+#      init-airflow-db:
+#        condition: service_healthy
+#
+#  webserver:
+#    <<: *airflow-common
+#    command: >
+#      bash -c "
+#      airflow webserver -p 8082
+#      "
+#    ports:
+#      - "8082:8082"
+#    depends_on:
+#      scheduler:
+#        condition: service_healthy
+#      init-airflow-db:
+#        condition: service_healthy
